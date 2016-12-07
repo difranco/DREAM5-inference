@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
+import logging
+
 from csv import reader
 from os.path import join
+from sys import stdout
 
 import numpy as np
 from numpy import array, empty, zeros, zeros_like
@@ -67,12 +70,16 @@ def golden_row_method(i, row, d):
   d[(genecoder.encode(row[0]), genecoder.encode(row[1]))] = row[2]
 
 def collect_goldens(isize, jsize, result_dict):
+  i_indices = []
+  j_indices = []
   result_array = dok_matrix((genecoder.total_seen(), genecoder.total_seen()), dtype = np.bool_)
 
   for ((i,j), entry) in result_dict.items():
-    if entry: result_array[i,j] = True
+    i_indices.append(i); j_indices.append(j)
+    if int(entry): result_array[i,j] = True
+    else: result_array[i,j] = False
 
-  return result_array
+  return result_array, np.array(i_indices, dtype=np.int32), np.array(j_indices, dtype=np.int32)
 
 def fit_and_score(expression_filename, treatment_filename, golden_filename):
 
@@ -85,12 +92,13 @@ def fit_and_score(expression_filename, treatment_filename, golden_filename):
     )
 
   nmf = NMF(
-    n_components=20, init='nndsvd', solver='cd', tol=0.0001, max_iter=200,
+    n_components=120, init='nndsvd', solver='cd', tol=0.0001, max_iter=200,
     alpha=0.1, l1_ratio=0.5, shuffle=True, nls_max_iter=2000)
 
   transformed_expressions = nmf.fit_transform(expressions)
 
-  print(expressions)
+  # print(expressions)
+  print('Expressions shape: ', expressions.shape)
 
   nne = NearestNeighbors(
     n_neighbors=5, radius=0.1, algorithm='auto', metric='manhattan', n_jobs=4)
@@ -109,58 +117,89 @@ def fit_and_score(expression_filename, treatment_filename, golden_filename):
 
   nnt.fit(treatments)
 
-  print(treatments)
+  # print(treatments)
+  print("Treatments shape: ", treatments.shape)
 
-  goldens = csv_map(golden_filename,
+  sparse_goldens, golden_i_indices, golden_j_indices = csv_map(golden_filename,
     row_method = golden_row_method,
     cleanup_method = collect_goldens
     )
 
-  print(goldens)
+  goldens = sparse_goldens.toarray()
 
-  neg_pos = KMeans(n_clusters=2, n_jobs=4)
-  neg_pos.fit(expressions.flatten().reshape(-1,1))
-  expression_centers = neg_pos.cluster_centers_
-  high_expression = max(expression_centers)
-  low_expression = min(expression_centers)
-  print(high_expression, low_expression)
+  # print(goldens)
+
+  def expression_modes(ex):
+    neg_pos = KMeans(n_clusters=2, n_jobs=4)
+    neg_pos.fit(ex.flatten().reshape(-1,1))
+    expression_centers = neg_pos.cluster_centers_
+    high_expression = max(expression_centers)
+    low_expression = min(expression_centers)
+    return (high_expression, low_expression)
+
+  (high_expression, low_expression) = expression_modes(expressions)
+  print("Expression level modes: ", high_expression, low_expression)
 
   # predict the goldens
   #  - transform the expression data to the nmf space
-  #  - synthesize a probe vector by setting that gene's element to the dataset average expression level and rest to zero
+  #  - synthesize a probe vector by setting that gene's element to the dataset max expression level and rest to zero
   #  - get nearest neighbors of probe in nmf and treatment spaces (must be near in both)
   #  - average together nmf representations of those rows
   #  - transform back to expression space and threshold; these are predictions
-  #  - compute AUROC and AUPR vs golden array
+  #  - compute AUROC vs golden array
 
-  predicted_expressions = zeros((genecoder.total_seen(), genecoder.total_seen()), dtype = np.bool_)
+  predicted_expressions = zeros((genecoder.total_seen(), genecoder.total_seen()), dtype = np.float64)
+  predicted_relationships = zeros((genecoder.total_seen(), genecoder.total_seen()), dtype = np.bool_)
 
   for i in range(genecoder.total_seen()):
     genevector = zeros((1,genecoder.total_seen()))
-    genevector[0,i] = np.average(expressions[:,i])
+    genevector[0,i] = np.max(expressions[:,i])
     transformed_genevector = nmf.transform(genevector)
     common_inds = []
-    kneighbors = 100
-    while len(common_inds) < 1:
-      (nmf_dist, nmf_neighbor_inds) = nne.kneighbors(transformed_genevector, kneighbors, True)
-      (cnd_dist, cnd_neighbor_inds) = nnt.kneighbors([treatments[i]], kneighbors, True)
-      common_inds = np.intersect1d(nmf_neighbor_inds, cnd_neighbor_inds, assume_unique=True)
-      print ('Trying with kneighbors = %d' % kneighbors, common_inds)
-      kneighbors = int(kneighbors * 1.33)
-
+    ex_neighbors = 20
+    t_neighbors = 3
+    (nmf_dist, nmf_neighbor_inds) = nne.kneighbors(transformed_genevector, min(expressions.shape[0], ex_neighbors), True)
+    # (cnd_dist, cnd_neighbor_inds) = nnt.kneighbors(treatments[nmf_neighbor_inds], min(treatments.shape[0], t_neighbors), True)
+    # common_inds = np.intersect1d(nmf_neighbor_inds, cnd_neighbor_inds, assume_unique=False)
+    common_inds = nmf_neighbor_inds
+    
     rows_to_average = transformed_expressions.take(common_inds, axis = 0)
-    average_transformed_expression = np.average(rows_to_average, axis = 0)
-    prediction_weights = nmf.inverse_transform(average_transformed_expression)
-    predictions = zeros(prediction_weights.shape, dtype = np.bool_)
-    for (i, p) in enumerate(predictions):
-      r = True if abs(high_expression - p) < abs(low_expression - p) else False
-      predictions[i] = r
-    for (j, p) in enumerate(predictions):
-      predicted_expressions[i,j] = p
-  print(predicted_expressions)
+    average_transformed_expression = np.average(rows_to_average, axis = 1)[0]
+    if i % 100 == 0:
+      stdout.write("\nAveraging transformed expressions for row %d." % i); stdout.flush()
+    else:
+      stdout.write('.'); stdout.flush()
+    # print("Average transformed expression for row %d: \n" % i, average_transformed_expression.shape)
+    average_expression_prediction = nmf.inverse_transform(average_transformed_expression)
+    # print("\nMax predicted expression vector component: ", max(average_expression_prediction))
+    predicted_expressions[i] = average_expression_prediction
 
-  auroc = roc_auc_score(goldens, predicted_expressions)
+  # from numpy.linalg import norm
+  # scaling_factor = norm(expressions[golden_i_indices, golden_j_indices]) / norm(predicted_expressions[golden_i_indices, golden_j_indices])
+  # predicted_expressions = predicted_expressions * scaling_factor
+
+  print("\nStarting prediction mode clustering")
+  high_prediction, low_prediction = expression_modes(predicted_expressions)
+  print("Predicted expression level modes: ", high_prediction, low_prediction)
+
+  for j in range(predicted_expressions.shape[1]):
+    gene_high_expression, gene_low_expression = expression_modes(predicted_expressions[:,j])
+    for i in range(predicted_expressions.shape[0]):
+      p = predicted_expressions[i,j]
+      r = True if abs(gene_high_expression - p) < abs(gene_low_expression - p) else False
+      predicted_relationships[i,j] = r
+  
+  # print(predicted_relationships)
+
+  auroc = roc_auc_score(goldens[golden_i_indices, golden_j_indices], predicted_relationships[golden_i_indices, golden_j_indices])
   print("AUROC: ", auroc)
+
+  def topcomponents(vec, num_components = 3):
+    return sorted(enumerate(vec), key = lambda x: x[1], reverse = True)[0:num_components]
+
+  print('Golden nonzero count: ', np.count_nonzero(goldens.flatten()))
+  print('Prediction nonzero count on golden set: ', np.count_nonzero(predicted_relationships[golden_i_indices, golden_j_indices]))
+  print('Prediction nonzero count on all genes: ', np.count_nonzero(predicted_relationships.flatten()))
 
 base = '/vagrant/DREAM5_network_inference_challenge/'
 
