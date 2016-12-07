@@ -178,26 +178,36 @@ def fit_and_score(expression_filename, treatment_filename, golden_filename):
   # scaling_factor = norm(expressions[golden_i_indices, golden_j_indices]) / norm(predicted_expressions[golden_i_indices, golden_j_indices])
   # predicted_expressions = predicted_expressions * scaling_factor
 
-  print("\nStarting prediction mode clustering")
-  high_prediction, low_prediction = expression_modes(predicted_expressions)
-  print("Predicted expression level modes: ", high_prediction, low_prediction)
+  # print("\nStarting prediction mode clustering")
+  # high_prediction, low_prediction = expression_modes(predicted_expressions)
+  # print("Predicted expression level modes: ", high_prediction, low_prediction)
+  
+  golden_nonzero_count = np.count_nonzero(goldens.flatten())
+
+  def topcomponents(vec, num_components = 3):
+    return sorted(enumerate(vec), key = lambda x: x[1], reverse = True)[0:num_components]
+
+  prediction_threshold = topcomponents(predicted_expressions[golden_i_indices, golden_j_indices], golden_nonzero_count)[-1][1]
+  print("\nPrediction threshold: ", prediction_threshold)
+
+  golden_i_set = set(golden_i_indices)
+  golden_j_set = set(golden_j_indices)
+  print("Golden i set size: %d", len(golden_i_set))
 
   for j in range(predicted_expressions.shape[1]):
-    gene_high_expression, gene_low_expression = expression_modes(predicted_expressions[:,j])
+    # gene_high_expression, gene_low_expression = expression_modes(predicted_expressions[:,j])
     for i in range(predicted_expressions.shape[0]):
       p = predicted_expressions[i,j]
-      r = True if abs(gene_high_expression - p) < abs(gene_low_expression - p) else False
+      # r = True if abs(gene_high_expression - p) < abs(gene_low_expression - p) else False
+      r = True if p > prediction_threshold and i in golden_i_set and j in golden_j_set else False
       predicted_relationships[i,j] = r
-  
+
   # print(predicted_relationships)
 
   auroc = roc_auc_score(goldens[golden_i_indices, golden_j_indices], predicted_relationships[golden_i_indices, golden_j_indices])
   print("AUROC: ", auroc)
 
-  def topcomponents(vec, num_components = 3):
-    return sorted(enumerate(vec), key = lambda x: x[1], reverse = True)[0:num_components]
-
-  print('Golden nonzero count: ', np.count_nonzero(goldens.flatten()))
+  print('Golden nonzero count: ', golden_nonzero_count)
   print('Prediction nonzero count on golden set: ', np.count_nonzero(predicted_relationships[golden_i_indices, golden_j_indices]))
   print('Prediction nonzero count on all genes: ', np.count_nonzero(predicted_relationships.flatten()))
 
