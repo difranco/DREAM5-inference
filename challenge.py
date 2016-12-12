@@ -12,10 +12,7 @@ from scipy.sparse import csr_matrix, dok_matrix
 
 from coder import Coder
 
-from sklearn.decomposition import NMF
 from sklearn.neighbors import NearestNeighbors
-
-from sklearn.cluster import KMeans, SpectralClustering
 
 from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
 
@@ -83,19 +80,33 @@ def collect_goldens(isize, jsize, result_dict):
 
 def fit_and_score(expression_filename, treatment_filename, golden_filename):
 
-  # Build NMF model of expression data
-
   expressions = csv_map(expression_filename,
     header_method = lambda j, entry: genecoder.encode(entry),
     entry_method = lambda i, j, entry, d: d.__setitem__((i,j), entry),
     cleanup_method = collect_in_array
     )
 
-  nmf = NMF(
-    n_components=120, init='nndsvd', solver='cd', tol=0.0001, max_iter=200,
-    alpha=0.1, l1_ratio=0.5, shuffle=True, nls_max_iter=2000)
+  from scipy.stats import pearsonr, spearmanr
 
-  transformed_expressions = nmf.fit_transform(expressions)
+  correlations = np.zeros((genecoder.total_seen(), genecoder.total_seen()), dtype = np.float64)
+
+  for i in range(genecoder.total_seen()):
+    for j in range(i, genecoder.total_seen()):
+      # correlate columns of each gene pair in expression matrix
+      if i == j:
+        correlations[i,i] = 1.0
+        continue
+      (r, pval) = pearsonr(expressions[:,i], expressions[:,j])
+      correlations[i,j] = r
+      correlations[j,i] = r
+
+  # Build dimension-reduced model of correlation data
+
+  from sklearn.decomposition import FastICA
+
+  nmf = FastICA(n_components=120)
+
+  transformed_correlations = nmf.fit_transform(correlations)
 
   # print(expressions)
   print('Expressions shape: ', expressions.shape)
@@ -103,7 +114,7 @@ def fit_and_score(expression_filename, treatment_filename, golden_filename):
   nne = NearestNeighbors(
     n_neighbors=5, radius=0.1, algorithm='auto', metric='manhattan', n_jobs=4)
 
-  nne.fit(transformed_expressions)
+  nne.fit(transformed_correlations)
 
   # Build nearest-neighbor index of chip treatments
 
@@ -129,26 +140,28 @@ def fit_and_score(expression_filename, treatment_filename, golden_filename):
 
   # print(goldens)
 
-  def expression_modes(ex):
-    neg_pos = KMeans(n_clusters=2, n_jobs=4)
-    neg_pos.fit(ex.flatten().reshape(-1,1))
-    expression_centers = neg_pos.cluster_centers_
-    high_expression = max(expression_centers)
-    low_expression = min(expression_centers)
-    return (high_expression, low_expression)
+  from sklearn.mixture import BayesianGaussianMixture
 
-  (high_expression, low_expression) = expression_modes(expressions)
-  print("Expression level modes: ", high_expression, low_expression)
+  def correlation_modes(ex):
+    modes = BayesianGaussianMixture(n_components = 3)
+    modes.fit(ex.flatten().reshape(-1,1))
+    expression_centers = modes.means_
+    (anticorrelated, uncorrelated, correlated) = sorted(expression_centers)
+    return (anticorrelated, uncorrelated, correlated)
+
+  (anticorrelated, uncorrelated, correlated) = [-1, 0, 1]
+  print("Correlation level modes: ", anticorrelated, uncorrelated, correlated)
 
   # predict the goldens
-  #  - transform the expression data to the nmf space
-  #  - synthesize a probe vector by setting that gene's element to the dataset max expression level and rest to zero
+  #  - compute overall correlation of gene expressions across all experiments
+  #  - transform the correlation data to the nmf space
+  #  - synthesize a probe vector by setting that gene's element to its max correlation level in the data and rest to zero
   #  - get nearest neighbors of probe in nmf and treatment spaces (must be near in both)
   #  - average together nmf representations of those rows
   #  - transform back to expression space and threshold; these are predictions
   #  - compute AUROC vs golden array
 
-  predicted_expressions = zeros((genecoder.total_seen(), genecoder.total_seen()), dtype = np.float64)
+  predicted_correlations = zeros((genecoder.total_seen(), genecoder.total_seen()), dtype = np.float64)
   predicted_relationships = zeros((genecoder.total_seen(), genecoder.total_seen()), dtype = np.bool_)
 
   for i in range(genecoder.total_seen()):
@@ -156,50 +169,37 @@ def fit_and_score(expression_filename, treatment_filename, golden_filename):
     genevector[0,i] = np.max(expressions[:,i])
     transformed_genevector = nmf.transform(genevector)
     common_inds = []
-    ex_neighbors = 20
+    ex_neighbors = 5
     t_neighbors = 3
     (nmf_dist, nmf_neighbor_inds) = nne.kneighbors(transformed_genevector, min(expressions.shape[0], ex_neighbors), True)
     # (cnd_dist, cnd_neighbor_inds) = nnt.kneighbors(treatments[nmf_neighbor_inds], min(treatments.shape[0], t_neighbors), True)
     # common_inds = np.intersect1d(nmf_neighbor_inds, cnd_neighbor_inds, assume_unique=False)
     common_inds = nmf_neighbor_inds
     
-    rows_to_average = transformed_expressions.take(common_inds, axis = 0)
-    average_transformed_expression = np.average(rows_to_average, axis = 1)[0]
+    rows_to_average = transformed_correlations.take(common_inds, axis = 0)
+    average_transformed_correlation = np.average(rows_to_average, axis = 1)[0]
     if i % 100 == 0:
       stdout.write("\nAveraging transformed expressions for row %d." % i); stdout.flush()
     else:
       stdout.write('.'); stdout.flush()
-    # print("Average transformed expression for row %d: \n" % i, average_transformed_expression.shape)
-    average_expression_prediction = nmf.inverse_transform(average_transformed_expression)
-    # print("\nMax predicted expression vector component: ", max(average_expression_prediction))
-    predicted_expressions[i] = average_expression_prediction
-
-  # from numpy.linalg import norm
-  # scaling_factor = norm(expressions[golden_i_indices, golden_j_indices]) / norm(predicted_expressions[golden_i_indices, golden_j_indices])
-  # predicted_expressions = predicted_expressions * scaling_factor
-
-  # print("\nStarting prediction mode clustering")
-  # high_prediction, low_prediction = expression_modes(predicted_expressions)
-  # print("Predicted expression level modes: ", high_prediction, low_prediction)
+    # print("Average transformed correlation for row %d: \n" % i, average_transformed_correlation.shape)
+    average_correlation_prediction = nmf.inverse_transform([average_transformed_correlation])
+    # print("\nMax predicted correlation vector component: ", max(average_expression_prediction))
+    predicted_correlations[i] = average_correlation_prediction
   
   golden_nonzero_count = np.count_nonzero(goldens.flatten())
 
   def topcomponents(vec, num_components = 3):
     return sorted(enumerate(vec), key = lambda x: x[1], reverse = True)[0:num_components]
 
-  prediction_threshold = topcomponents(predicted_expressions[golden_i_indices, golden_j_indices], golden_nonzero_count)[-1][1]
-  print("\nPrediction threshold: ", prediction_threshold)
-
   golden_i_set = set(golden_i_indices)
   golden_j_set = set(golden_j_indices)
-  print("Golden i set size: %d", len(golden_i_set))
+  print("Golden i set size: %d" % len(golden_i_set))
 
-  for j in range(predicted_expressions.shape[1]):
-    # gene_high_expression, gene_low_expression = expression_modes(predicted_expressions[:,j])
-    for i in range(predicted_expressions.shape[0]):
-      p = predicted_expressions[i,j]
-      # r = True if abs(gene_high_expression - p) < abs(gene_low_expression - p) else False
-      r = True if p > prediction_threshold and i in golden_i_set and j in golden_j_set else False
+  for j in range(predicted_correlations.shape[1]):
+    for i in range(predicted_correlations.shape[0]):
+      p = predicted_correlations[i,j]
+      r = True if abs(correlated - p) < abs(uncorrelated - p) or abs(anticorrelated - p) < abs(uncorrelated - p) else False
       predicted_relationships[i,j] = r
 
   # print(predicted_relationships)
